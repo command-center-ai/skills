@@ -20,10 +20,30 @@ The user asks for a walkthrough of the current branch, a pull request, a commit 
 Run the runner. The runner does all the work — installation detection, backend startup, auth/model/workspace checks, walkthrough generation, and browser open.
 
 ```bash
-node "${CLAUDE_PLUGIN_ROOT}/skills/walkthrough/run.mjs" [from..to]
+node "${CLAUDE_PLUGIN_ROOT}/skills/walkthrough/run.mjs" [from..to] [--files=PATTERN[,PATTERN...]]
 ```
 
-`[from..to]` is optional. When omitted, the runner defaults to `merge-base(HEAD, main)..HEAD`.
+Both arguments are optional. By default the walkthrough covers **the whole diff** for the resolved range.
+
+**Ref range** — `[from..to]`:
+- Omit → defaults to `merge-base(HEAD, <base>)..HEAD`, where `<base>` is the symbolic ref of `origin/HEAD`, falling back to `origin/main` / `origin/master` / `main` / `master`.
+- Pass anything `git` understands: SHAs, branches, `HEAD~3..HEAD`, etc.
+
+**File filter** — `--files=PATTERN[,PATTERN...]`:
+- Comma-separated repo-relative globs. `*` matches non-slash chars; `**` matches across directories.
+- Prefix a pattern with `!` to exclude. If you pass only exclusions, the implicit include is `**` ("everything except").
+- The runner expands patterns against `git diff --name-only from..to` locally and sends the concrete list to the backend.
+
+Examples — pick whichever matches the user's intent:
+
+| User intent | Command |
+|---|---|
+| Whole branch vs base (default) | (no args) |
+| Yesterday's commit | `$(git log --since="2 days ago" --until="1 day ago" --format=%H \| tail -1)..HEAD` |
+| Last 3 commits | `HEAD~3..HEAD` |
+| Whole branch, but skip tests | `--files=!**/*.test.*,!**/*.spec.*,!**/__tests__/**` |
+| Only TS files in `src/` | `--files=src/**/*.ts` |
+| Yesterday's commit, no tests | `<sha>..HEAD --files=!**/*.test.*` |
 
 ## Interpreting the output
 

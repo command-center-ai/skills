@@ -63,6 +63,7 @@ const EXIT = {
   QUOTA: 7,
   NO_WORKSPACE: 8,
   GENERATION_FAILED: 9,
+  NO_FILES_MATCHED: 10,
 };
 
 // #######################################
@@ -516,10 +517,129 @@ function pickBaseBranch(cwd) {
 }
 
 // #######################################
+// File-pattern resolution
+// #######################################
+//
+// `--files=PATTERN[,PATTERN...]` filters the diff down to a subset of
+// changed files. Patterns are repo-relative globs:
+//   - `*`        matches any non-slash characters
+//   - `**`       matches across directories (zero or more segments)
+//   - `?`        matches a single non-slash character
+//   - leading `!` flips the pattern to an exclusion
+// If only exclusions are given, an implicit `**` include is added —
+// i.e. "everything in the diff except these."
+//
+// Globbing happens locally against `git diff --name-only` output, so
+// the backend still receives a concrete file list.
+
+function parsePatternSpec(spec) {
+  const items = spec
+    .split(",")
+    .map((s) => s.trim())
+    .filter(Boolean);
+  const includes = [];
+  const excludes = [];
+  for (const p of items) {
+    if (p.startsWith("!")) excludes.push(p.slice(1));
+    else includes.push(p);
+  }
+  // If the user passed only exclusions, treat unscoped paths as included.
+  if (includes.length === 0) includes.push("**");
+  return { includes, excludes };
+}
+
+// Compile a glob to an anchored RegExp. Path separators are forward slashes
+// (matches git's output); `**` matches across segments, `*` doesn't.
+function globToRegex(glob) {
+  let re = "";
+  let i = 0;
+  while (i < glob.length) {
+    // Treat `/**` followed by `/` or end of pattern as "zero or more segments".
+    // Without this, `src/**/*.ts` would not match `src/foo.ts` (top-level).
+    if (
+      glob.slice(i, i + 3) === "/**" &&
+      (i + 3 === glob.length || glob[i + 3] === "/")
+    ) {
+      re += "(?:/[^/]+)*";
+      i += 3;
+      if (glob[i] === "/") {
+        re += "/";
+        i += 1;
+      }
+      continue;
+    }
+    // Leading `**/`: zero or more segments at the start.
+    if (i === 0 && glob.slice(0, 3) === "**/") {
+      re += "(?:[^/]+/)*";
+      i += 3;
+      continue;
+    }
+    const c = glob[i];
+    if (c === "*" && glob[i + 1] === "*") {
+      re += ".*";
+      i += 2;
+    } else if (c === "*") {
+      re += "[^/]*";
+      i += 1;
+    } else if (c === "?") {
+      re += "[^/]";
+      i += 1;
+    } else if (".+()|^$\\{}[]".includes(c)) {
+      re += "\\" + c;
+      i += 1;
+    } else {
+      re += c;
+      i += 1;
+    }
+  }
+  return new RegExp("^" + re + "$");
+}
+
+function listChangedFiles(cwd, from, to) {
+  const out = runGit(["diff", "--name-only", `${from}..${to}`], cwd);
+  return out
+    .split("\n")
+    .map((s) => s.trim())
+    .filter(Boolean);
+}
+
+function resolveFiles(argv, cwd, from, to) {
+  const flag = argv.find((a) => a.startsWith("--files="));
+  if (!flag) return undefined; // No filter — backend defaults to whole diff.
+
+  const { includes, excludes } = parsePatternSpec(flag.slice("--files=".length));
+  const includeRes = includes.map(globToRegex);
+  const excludeRes = excludes.map(globToRegex);
+
+  const candidates = listChangedFiles(cwd, from, to);
+  const matched = candidates.filter(
+    (path) =>
+      includeRes.some((r) => r.test(path)) &&
+      !excludeRes.some((r) => r.test(path)),
+  );
+
+  if (matched.length === 0) {
+    fail(
+      "no-files-matched",
+      `--files patterns matched no files in ${from}..${to} (${candidates.length} candidate${candidates.length === 1 ? "" : "s"}).`,
+      EXIT.NO_FILES_MATCHED,
+      { includes, excludes, candidateCount: candidates.length },
+    );
+  }
+  return matched;
+}
+
+// #######################################
 // Walkthrough generation
 // #######################################
 
-async function createWalkthrough({ sessionToken, workspaceId, from, to }) {
+async function createWalkthrough({
+  sessionToken,
+  workspaceId,
+  from,
+  to,
+  files,
+}) {
   try {
     const { taskId } = await trpcCall({
       path: "walkthroughs.create",
@@ -531,6 +651,8 @@ async function createWalkthrough({ sessionToken, workspaceId, from, to }) {
         intelligence: "smart",
         level: "medium",
         source: "external-skill",
+        // Omit when no filter — backend treats absence as "whole diff".
+        ...(files ? { files } : {}),
       },
       sessionToken,
     });
@@ -661,13 +783,22 @@ async function main() {
   status(`Resolved workspace ${workspaceId}.`, { workspaceId });
 
   const { from, to } = resolveRefs(argv, cwd);
-  status(`Generating walkthrough for ${from}..${to}…`, { from, to });
+  const files = resolveFiles(argv, cwd, from, to);
+  if (files) {
+    status(
+      `Generating walkthrough for ${from}..${to} (${files.length} file${files.length === 1 ? "" : "s"} after filtering)…`,
+      { from, to, files },
+    );
+  } else {
+    status(`Generating walkthrough for ${from}..${to}…`, { from, to });
+  }
 
   const taskId = await createWalkthrough({
     sessionToken,
     workspaceId,
     from,
     to,
+    files,
   });
 
   const walkthroughId = await waitForCompletion({
