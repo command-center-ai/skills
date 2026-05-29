@@ -20,12 +20,19 @@ import { setTimeout as sleep } from "node:timers/promises";
 // Constants
 // #######################################
 
+// The backend binds to 127.0.0.1 (see backend/src/config/server-config.ts).
+// Its actual port is chosen at startup — 6112 is the preferred port, but
+// it falls back to the next available one if in use. Read it from the
+// port-discovery file the backend writes after binding (see
+// backend/src/utils/port-utils.ts).
 const BACKEND_HOST = "127.0.0.1";
-const BACKEND_PORT = 6112;
-const BACKEND_ORIGIN = `http://${BACKEND_HOST}:${BACKEND_PORT}`;
+const PORT_FILE_RELATIVE = ["runtime", ".backend-port"];
 const TRPC_PREFIX = "/trpc";
-const HEALTH_URL = `${BACKEND_ORIGIN}/health`;
 const SESSION_HEADER = "x-session-token";
+
+// Resolved origin lives here once ensureRunning() succeeds. Read by
+// trpcCall, pingHealth, and the browser-fallback open.
+let backendOrigin = null;
 
 // Minimum CC version that exposes the endpoints this skill requires
 // (walkthroughs.getTaskStatus, walkthroughs.create's `source` field,
@@ -147,9 +154,28 @@ function safeStat(p) {
 // Backend launch / readiness
 // #######################################
 
-async function pingHealth() {
+// Read the bound port from the port-discovery file the backend writes
+// after Bun.serve() succeeds. Returns null if the file is absent,
+// half-written, or doesn't contain a usable port — caller decides
+// whether to retry or fail.
+function discoverOrigin(dataDir) {
+  const file = join(dataDir, ...PORT_FILE_RELATIVE);
+  if (!existsSync(file)) return null;
   try {
-    const res = await fetch(HEALTH_URL, {
+    const parsed = JSON.parse(readFileSync(file, "utf8"));
+    const port = parsed?.port;
+    if (typeof port !== "number" || !Number.isInteger(port) || port <= 0) {
+      return null;
+    }
+    return `http://${BACKEND_HOST}:${port}`;
+  } catch {
+    return null;
+  }
+}
+
+async function pingHealth(origin) {
+  try {
+    const res = await fetch(`${origin}/health`, {
       signal: AbortSignal.timeout(2_000),
     });
     return res.ok;
@@ -158,13 +184,17 @@ async function pingHealth() {
   }
 }
 
-async function waitForHealthy(timeoutMs) {
+// Resolve a healthy origin: poll for the port file to appear AND for
+// /health on that port to respond. Returns null if the deadline passes
+// before both conditions hold.
+async function waitForHealthy(dataDir, timeoutMs) {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
-    if (await pingHealth()) return true;
+    const origin = discoverOrigin(dataDir);
+    if (origin && (await pingHealth(origin))) return origin;
     await sleep(HEALTH_POLL_INTERVAL_MS);
   }
-  return false;
+  return null;
 }
 
 function launchElectron() {
@@ -188,7 +218,12 @@ function launchHeadlessBackend() {
 }
 
 async function ensureRunning(install) {
-  if (await pingHealth()) return;
+  // Fast path: backend already up.
+  const existing = discoverOrigin(install.dataDir);
+  if (existing && (await pingHealth(existing))) {
+    backendOrigin = existing;
+    return;
+  }
 
   if (install.hasElectron) {
     status("Launching Command Center…");
@@ -212,14 +247,15 @@ async function ensureRunning(install) {
   }
 
   status("Waiting for Command Center backend…");
-  const ok = await waitForHealthy(HEALTH_TIMEOUT_MS);
-  if (!ok) {
+  const origin = await waitForHealthy(install.dataDir, HEALTH_TIMEOUT_MS);
+  if (!origin) {
     fail(
       "not-running",
-      `Backend at ${BACKEND_ORIGIN} did not respond within ${HEALTH_TIMEOUT_MS / 1000}s.`,
+      `Command Center backend did not become ready within ${HEALTH_TIMEOUT_MS / 1000}s (waiting for ${join(install.dataDir, ...PORT_FILE_RELATIVE)} and a healthy /health response).`,
       EXIT.NOT_RUNNING,
     );
   }
+  backendOrigin = origin;
 }
 
 // #######################################
@@ -258,7 +294,12 @@ class BackendError extends Error {
 }
 
 async function trpcCall({ path, type, input, sessionToken }) {
-  const url = new URL(`${TRPC_PREFIX}/${path}`, BACKEND_ORIGIN);
+  if (!backendOrigin) {
+    throw new Error(
+      "trpcCall: backend origin not resolved — ensureRunning must run first.",
+    );
+  }
+  const url = new URL(`${TRPC_PREFIX}/${path}`, backendOrigin);
   const headers = { "content-type": "application/json" };
   if (sessionToken) headers[SESSION_HEADER] = sessionToken;
 
@@ -580,7 +621,7 @@ function openWalkthrough({ install, walkthroughId, workspaceId }) {
     workspace: workspaceId,
   });
   // Always include the browser URL in the result so the agent can echo it.
-  const browserUrl = `${BACKEND_ORIGIN}/walkthrough?${params.toString()}`;
+  const browserUrl = `${backendOrigin}/walkthrough?${params.toString()}`;
 
   if (install.hasElectron) {
     // Deep link → Electron main process catches via app.on("open-url") /
