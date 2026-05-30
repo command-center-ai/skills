@@ -26,6 +26,11 @@ import { setTimeout as sleep } from "node:timers/promises";
 // port-discovery file the backend writes after binding (see
 // backend/src/utils/port-utils.ts).
 const BACKEND_HOST = "127.0.0.1";
+// CC binds to its preferred port (DEFAULT_BACKEND_PORT) when free, falling
+// back to the next available one. We try the default first when no port
+// file is available — covers users who hand-launched CC without setting
+// CC_PORT_FILE_DIR.
+const DEFAULT_BACKEND_PORT = 6112;
 const PORT_FILE_RELATIVE = ["runtime", ".backend-port"];
 const TRPC_PREFIX = "/trpc";
 const SESSION_HEADER = "x-session-token";
@@ -162,6 +167,11 @@ function safeStat(p) {
 // after Bun.serve() succeeds. Returns null if the file is absent,
 // half-written, or doesn't contain a usable port — caller decides
 // whether to retry or fail.
+//
+// The port file is only written when CC_PORT_FILE_DIR is set in the
+// backend's env (the Electron app sets it; a hand-launched `npx`
+// invocation does not). When the file is missing, the caller should
+// fall back to probing the default port.
 function discoverOrigin(dataDir) {
   const file = join(dataDir, ...PORT_FILE_RELATIVE);
   if (!existsSync(file)) return null;
@@ -177,6 +187,8 @@ function discoverOrigin(dataDir) {
   }
 }
 
+const DEFAULT_ORIGIN = `http://${BACKEND_HOST}:${DEFAULT_BACKEND_PORT}`;
+
 async function pingHealth(origin) {
   try {
     const res = await fetch(`${origin}/health`, {
@@ -188,14 +200,16 @@ async function pingHealth(origin) {
   }
 }
 
-// Resolve a healthy origin: poll for the port file to appear AND for
-// /health on that port to respond. Returns null if the deadline passes
-// before both conditions hold.
+// Resolve a healthy origin. Prefer the port the backend advertised in its
+// port file; fall back to probing the default port for hand-launched
+// instances (those don't write a port file). Returns null if the
+// deadline passes without either path responding.
 async function waitForHealthy(dataDir, timeoutMs) {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
-    const origin = discoverOrigin(dataDir);
-    if (origin && (await pingHealth(origin))) return origin;
+    const fromFile = discoverOrigin(dataDir);
+    if (fromFile && (await pingHealth(fromFile))) return fromFile;
+    if (await pingHealth(DEFAULT_ORIGIN)) return DEFAULT_ORIGIN;
     await sleep(HEALTH_POLL_INTERVAL_MS);
   }
   return null;
@@ -213,17 +227,21 @@ function launchElectron() {
   spawn(cmd[0], cmd[1], { detached: true, stdio: "ignore" }).unref();
 }
 
-function launchHeadlessBackend() {
+function launchHeadlessBackend(dataDir) {
   // `--no-open` is confirmed against the published binary: when the Electron
   // app spawns its own backend it uses exactly this flag (visible via
   // `ps aux` on a running CC install). We deliberately omit `--worker`,
   // which appears IPC-coupled to the Electron parent.
   //
+  // CC_PORT_FILE_DIR is what makes the backend write its bound port to
+  // <dataDir>/runtime/.backend-port (see backend/src/utils/port-utils.ts).
+  // The Electron app sets this for its child; a bare `npx` invocation does
+  // NOT set it by default, which is why hand-launched backends are
+  // undiscoverable. We set it explicitly so our spawn behaves like the
+  // Electron-spawned one.
+  //
   // Detached + ignored stdio so the backend keeps running after this
-  // process exits. The /health + port-file polling loop below decides
-  // success — if `npx` is missing, the package fails to install, or the
-  // backend doesn't come up, the caller times out with a clear message
-  // rather than this function silently returning the wrong thing.
+  // process exits. The /health + port-file polling loop decides success.
   //
   // First run downloads ~80MB; warn the agent so it can surface that to
   // the user instead of looking like a hang.
@@ -235,6 +253,10 @@ function launchHeadlessBackend() {
     spawn(cmd, ["-y", "@command-center/command-center", "--no-open"], {
       detached: true,
       stdio: "ignore",
+      env: {
+        ...process.env,
+        CC_PORT_FILE_DIR: join(dataDir, "runtime"),
+      },
     }).unref();
     return true;
   } catch {
@@ -243,10 +265,15 @@ function launchHeadlessBackend() {
 }
 
 async function ensureRunning(install) {
-  // Fast path: backend already up.
-  const existing = discoverOrigin(install.dataDir);
-  if (existing && (await pingHealth(existing))) {
-    backendOrigin = existing;
+  // Fast path: backend already up. Check the advertised port first, then
+  // probe the default port — hand-launched instances skip the port file.
+  const fromFile = discoverOrigin(install.dataDir);
+  if (fromFile && (await pingHealth(fromFile))) {
+    backendOrigin = fromFile;
+    return;
+  }
+  if (await pingHealth(DEFAULT_ORIGIN)) {
+    backendOrigin = DEFAULT_ORIGIN;
     return;
   }
 
@@ -255,7 +282,7 @@ async function ensureRunning(install) {
     status("Launching Command Center…");
     launchElectron();
   } else if (install.hasData) {
-    const launched = launchHeadlessBackend();
+    const launched = launchHeadlessBackend(install.dataDir);
     if (!launched) {
       actionRequired(
         "not-running",
