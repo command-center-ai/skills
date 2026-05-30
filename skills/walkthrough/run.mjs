@@ -42,7 +42,10 @@ let backendOrigin = null;
 const MIN_BACKEND_VERSION = "0.0.0";
 
 // How long to wait for the backend to come up after we launch it.
+// Electron path is local: a few seconds at most. Headless (npx) path may
+// have to download ~80MB on first run, so give it a bigger budget.
 const HEALTH_TIMEOUT_MS = 20_000;
+const HEADLESS_HEALTH_TIMEOUT_MS = 90_000;
 const HEALTH_POLL_INTERVAL_MS = 250;
 
 // How long between getTaskStatus polls.
@@ -211,15 +214,32 @@ function launchElectron() {
 }
 
 function launchHeadlessBackend() {
-  // The CC binary distribution is published as `@command-center/command-center`
-  // (https://www.npmjs.com/package/@command-center/command-center), so the
-  // package side is settled. What's not settled: the CLI flags. The plan
-  // referenced `--no-open` but I haven't verified it against the published
-  // bin. Leaving this stub returning false until the flag surface is
-  // confirmed — premature spawning would either pop the Electron UI when
-  // headless was wanted or hang on an unknown flag.
-  // TODO: verify `@command-center/command-center` --help, then spawn here.
-  return false;
+  // `--no-open` is confirmed against the published binary: when the Electron
+  // app spawns its own backend it uses exactly this flag (visible via
+  // `ps aux` on a running CC install). We deliberately omit `--worker`,
+  // which appears IPC-coupled to the Electron parent.
+  //
+  // Detached + ignored stdio so the backend keeps running after this
+  // process exits. The /health + port-file polling loop below decides
+  // success — if `npx` is missing, the package fails to install, or the
+  // backend doesn't come up, the caller times out with a clear message
+  // rather than this function silently returning the wrong thing.
+  //
+  // First run downloads ~80MB; warn the agent so it can surface that to
+  // the user instead of looking like a hang.
+  status(
+    "Starting Command Center via npx (first run downloads ~80MB; subsequent runs are cached)…",
+  );
+  try {
+    const cmd = platform() === "win32" ? "npx.cmd" : "npx";
+    spawn(cmd, ["-y", "@command-center/command-center", "--no-open"], {
+      detached: true,
+      stdio: "ignore",
+    }).unref();
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 async function ensureRunning(install) {
@@ -230,6 +250,7 @@ async function ensureRunning(install) {
     return;
   }
 
+  let timeoutMs = HEALTH_TIMEOUT_MS;
   if (install.hasElectron) {
     status("Launching Command Center…");
     launchElectron();
@@ -238,25 +259,26 @@ async function ensureRunning(install) {
     if (!launched) {
       actionRequired(
         "not-running",
-        "Command Center data is present but the backend isn't running. Open the Command Center app, or run `npx -y @command-center/command-center` to start it, then re-run this command.",
+        "Command Center data is present but the backend isn't running. Open the Command Center app, or run `npx -y @command-center/command-center --no-open` to start it, then re-run this command.",
       );
       process.exit(EXIT.NOT_RUNNING);
     }
+    timeoutMs = HEADLESS_HEALTH_TIMEOUT_MS;
   } else {
     actionRequired(
       "not-installed",
-      "Command Center is not installed. Download it at https://up-to-speed.ai or run `npx -y @command-center/command-center`.",
+      "Command Center is not installed. Download it at https://up-to-speed.ai or run `npx -y @command-center/command-center --no-open`.",
       { url: "https://up-to-speed.ai" },
     );
     process.exit(EXIT.NOT_INSTALLED);
   }
 
   status("Waiting for Command Center backend…");
-  const origin = await waitForHealthy(install.dataDir, HEALTH_TIMEOUT_MS);
+  const origin = await waitForHealthy(install.dataDir, timeoutMs);
   if (!origin) {
     fail(
       "not-running",
-      `Command Center backend did not become ready within ${HEALTH_TIMEOUT_MS / 1000}s (waiting for ${join(install.dataDir, ...PORT_FILE_RELATIVE)} and a healthy /health response).`,
+      `Command Center backend did not become ready within ${timeoutMs / 1000}s (waiting for ${join(install.dataDir, ...PORT_FILE_RELATIVE)} and a healthy /health response).`,
       EXIT.NOT_RUNNING,
     );
   }
