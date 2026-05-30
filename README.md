@@ -1,6 +1,6 @@
 # Command Center Skills
 
-Public skills for [Command Center](https://commandcenter.ai), usable from Claude Code and any CLI agent with Node ≥18.
+Public skills for [Command Center](https://commandcenter.ai), usable from Claude Code, Codex, and any agent supported by the [`skills`](https://www.npmjs.com/package/skills) CLI.
 
 | Skill | What it does |
 |---|---|
@@ -8,19 +8,11 @@ Public skills for [Command Center](https://commandcenter.ai), usable from Claude
 
 ## Install
 
-**Claude Code**
-
 ```
-/plugin install up-to-speed/skills
+npx skills add up-to-speed/skills
 ```
 
-**npx (Codex, terminal, anywhere with Node ≥18)**
-
-```
-npx -y @commandcenter/skills walkthrough
-```
-
-`npx @commandcenter/skills <skill> [args]` is the universal entry: the package ships one `skills` bin that dispatches to the named skill.
+Add `--skill walkthrough` to install just one skill, `-g` for a global (user-wide) install, or `-a <agent>` to target a specific agent. See the [skills CLI docs](https://www.npmjs.com/package/skills) for the full option list and the supported-agent matrix.
 
 ## License
 

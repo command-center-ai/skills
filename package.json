@@ -15,21 +15,12 @@
   "engines": {
     "node": ">=18"
   },
-  "bin": {
-    "skills": "./bin/skills.mjs"
-  },
-  "files": [
-    "bin",
-    "skills",
-    ".claude-plugin",
-    "README.md",
-    "LICENSE"
-  ],
   "keywords": [
     "command-center",
     "claude-code",
     "codex",
-    "skill",
+    "skills",
+    "agent-skills",
     "walkthrough"
   ]
 }
