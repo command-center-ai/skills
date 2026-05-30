@@ -5,12 +5,12 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/up-to-speed/skills.git"
+    "url": "git+https://github.com/command-center-ai/skills.git"
   },
   "bugs": {
-    "url": "https://github.com/up-to-speed/skills/issues"
+    "url": "https://github.com/command-center-ai/skills/issues"
   },
-  "homepage": "https://github.com/up-to-speed/skills#readme",
+  "homepage": "https://github.com/command-center-ai/skills#readme",
   "type": "module",
   "engines": {
     "node": ">=18"
