@@ -38,6 +38,12 @@ Both arguments are optional. By default the walkthrough covers **the whole diff*
 **Ref range** — `[from..to]`:
 - Omit → defaults to `merge-base(HEAD, <base>)..HEAD`, where `<base>` is the symbolic ref of `origin/HEAD`, falling back to `origin/main` / `origin/master` / `main` / `master`.
 - Pass anything `git` understands: SHAs, branches, `HEAD~3..HEAD`, etc.
+- Special tokens: `WORKING_TREE` (uncommitted changes) and `STAGED` (index). Example: `HEAD..WORKING_TREE`.
+
+**Convenience flags** (equivalent to ref-range tokens above):
+- `--working-tree` → diff merge-base-against-base to your current working tree (includes uncommitted edits).
+- `--staged` → `HEAD..STAGED` (just what's `git add`-ed).
+- `--port=<port>` → talk to a specific Command Center backend port. Useful when multiple CC instances run (developer environments) or when the runner can't auto-discover the right one.
 
 **File filter** — `--files=PATTERN[,PATTERN...]`:
 - Comma-separated repo-relative globs. `*` matches non-slash chars; `**` matches across directories.
@@ -54,6 +60,9 @@ Examples — pick whichever matches the user's intent:
 | Whole branch, but skip tests | `--files=!**/*.test.*,!**/*.spec.*,!**/__tests__/**` |
 | Only TS files in `src/` | `--files=src/**/*.ts` |
 | Yesterday's commit, no tests | `<sha>..HEAD --files=!**/*.test.*` |
+| Uncommitted edits | `--working-tree` |
+| Uncommitted edits, only `src/` | `--working-tree --files=src/**/*.ts` |
+| Just what's staged | `--staged` |
 
 ## Interpreting the output
 

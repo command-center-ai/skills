@@ -175,9 +175,8 @@ function safeStat(p) {
 // #######################################
 
 // Read the bound port from the port-discovery file the backend writes
-// after Bun.serve() succeeds. Returns null if the file is absent,
-// half-written, or doesn't contain a usable port — caller decides
-// whether to retry or fail.
+// after Bun.serve() succeeds. Returns the origin + file metadata, or
+// null if the file is absent/half-written/garbage.
 //
 // The port file is only written when CC_PORT_FILE_DIR is set in the
 // backend's env (the Electron app sets it; a hand-launched `npx`
@@ -192,7 +191,14 @@ function discoverOrigin(dataDir) {
     if (typeof port !== "number" || !Number.isInteger(port) || port <= 0) {
       return null;
     }
-    return `http://${BACKEND_HOST}:${port}`;
+    const stat = statSync(file);
+    return {
+      origin: `http://${BACKEND_HOST}:${port}`,
+      port,
+      file,
+      mtimeIso: stat.mtime.toISOString(),
+      pid: typeof parsed.pid === "number" ? parsed.pid : null,
+    };
   } catch {
     return null;
   }
@@ -200,30 +206,64 @@ function discoverOrigin(dataDir) {
 
 const DEFAULT_ORIGIN = `http://${BACKEND_HOST}:${DEFAULT_BACKEND_PORT}`;
 
+// Tagged result so callers can tell the failure modes apart in error
+// messages: "nothing listening" (ECONNREFUSED) is a different signal
+// from "we got blocked" (sandbox / firewall / timeout).
 async function pingHealth(origin) {
   try {
     const res = await fetch(`${origin}/health`, {
       signal: AbortSignal.timeout(2_000),
     });
-    return res.ok;
-  } catch {
-    return false;
+    return res.ok
+      ? { kind: "ok" }
+      : { kind: "http-error", status: res.status };
+  } catch (err) {
+    // Node 18+ surfaces the underlying error code on .cause for fetch
+    // failures: ECONNREFUSED, ENETUNREACH, ETIMEDOUT, etc.
+    const code = err?.cause?.code ?? err?.code ?? null;
+    if (err?.name === "TimeoutError" || code === "ETIMEDOUT") {
+      return { kind: "timeout" };
+    }
+    if (code === "ECONNREFUSED") return { kind: "refused" };
+    return { kind: "error", code: code ?? "unknown", message: err?.message };
   }
 }
 
-// Resolve a healthy origin. Prefer the port the backend advertised in its
-// port file; fall back to probing the default port for hand-launched
-// instances (those don't write a port file). Returns null if the
-// deadline passes without either path responding.
-async function waitForHealthy(dataDir, timeoutMs) {
+// Resolve a healthy origin. Prefer (a) any explicit override, (b) the
+// port the backend advertised in its port file, (c) the default port
+// for hand-launched instances. Returns the resolved origin, or a probe
+// summary describing what we tried and how each probe failed.
+async function waitForHealthy(dataDir, timeoutMs, override) {
   const deadline = Date.now() + timeoutMs;
+  // Latest probe result per origin, used for the failure-summary message.
+  const lastResult = new Map();
+
   while (Date.now() < deadline) {
     const fromFile = discoverOrigin(dataDir);
-    if (fromFile && (await pingHealth(fromFile))) return fromFile;
-    if (await pingHealth(DEFAULT_ORIGIN)) return DEFAULT_ORIGIN;
+
+    // Probe each candidate in priority order; first OK wins.
+    const candidates = [];
+    if (override) candidates.push({ origin: override, source: "override" });
+    if (fromFile) {
+      candidates.push({ origin: fromFile.origin, source: "port-file" });
+    }
+    candidates.push({ origin: DEFAULT_ORIGIN, source: "default-port" });
+
+    for (const c of candidates) {
+      const result = await pingHealth(c.origin);
+      lastResult.set(c.origin, { ...c, ...result });
+      if (result.kind === "ok") {
+        return { ok: true, origin: c.origin };
+      }
+    }
     await sleep(HEALTH_POLL_INTERVAL_MS);
   }
-  return null;
+
+  return {
+    ok: false,
+    portFile: discoverOrigin(dataDir), // for surfacing mtime/pid
+    probes: [...lastResult.values()],
+  };
 }
 
 function launchElectron() {
@@ -279,17 +319,23 @@ function launchHeadlessBackend(dataDir) {
   }
 }
 
-async function ensureRunning(install) {
-  // Fast path: backend already up. Check the advertised port first, then
-  // probe the default port — hand-launched instances skip the port file.
-  const fromFile = discoverOrigin(install.dataDir);
-  if (fromFile && (await pingHealth(fromFile))) {
-    backendOrigin = fromFile;
+async function ensureRunning(install, override) {
+  // Fast path: backend already up. waitForHealthy with a zero deadline
+  // does one pass through (override → port-file → default-port).
+  const fast = await waitForHealthy(install.dataDir, 0, override);
+  if (fast.ok) {
+    backendOrigin = fast.origin;
+    status(`Found running Command Center at ${fast.origin}.`, {
+      backendOrigin: fast.origin,
+    });
     return;
   }
-  if (await pingHealth(DEFAULT_ORIGIN)) {
-    backendOrigin = DEFAULT_ORIGIN;
-    return;
+
+  // With an explicit override, the user expects us to use that specific
+  // backend — don't auto-spawn another one.
+  if (override) {
+    surfaceUnreachable(fast, install, "override", null);
+    process.exit(EXIT.NOT_RUNNING);
   }
 
   let timeoutMs = HEALTH_TIMEOUT_MS;
@@ -318,20 +364,62 @@ async function ensureRunning(install) {
   }
 
   status("Waiting for Command Center backend…");
-  const origin = await waitForHealthy(install.dataDir, timeoutMs);
-  if (!origin) {
-    const portFile = join(install.dataDir, ...PORT_FILE_RELATIVE);
-    const logHint = launchLogPath
-      ? ` See ${launchLogPath} for the spawn's output.`
-      : "";
-    fail(
-      "not-running",
-      `Command Center backend did not become ready within ${timeoutMs / 1000}s (tried ${portFile} for a written port, and ${DEFAULT_ORIGIN}/health).${logHint}`,
-      EXIT.NOT_RUNNING,
-      { launchLogPath },
-    );
+  const result = await waitForHealthy(install.dataDir, timeoutMs, override);
+  if (!result.ok) {
+    surfaceUnreachable(result, install, "launch", launchLogPath);
+    process.exit(EXIT.NOT_RUNNING);
   }
-  backendOrigin = origin;
+  backendOrigin = result.origin;
+  status(`Backend ready at ${result.origin}.`, { backendOrigin: result.origin });
+}
+
+// Format an unreachable-backend failure so the error message and the
+// structured data both carry enough detail to diagnose multi-instance
+// dev setups, sandbox/firewall blocks, and stale port files.
+function surfaceUnreachable(result, install, phase, launchLogPath) {
+  const probeSummary = (result.probes ?? [])
+    .map((p) => {
+      const tag =
+        p.kind === "refused"
+          ? "ECONNREFUSED (nothing listening)"
+          : p.kind === "timeout"
+            ? "timeout (sandbox / firewall?)"
+            : p.kind === "http-error"
+              ? `HTTP ${p.status}`
+              : p.kind === "error"
+                ? `${p.code}`
+                : p.kind;
+      return `  - ${p.origin} (${p.source}): ${tag}`;
+    })
+    .join("\n");
+
+  const portFileInfo = result.portFile
+    ? `\nPort file: ${result.portFile.file} → :${result.portFile.port} (written ${result.portFile.mtimeIso}${result.portFile.pid ? `, pid ${result.portFile.pid}` : ""}).`
+    : `\nPort file: not present at ${join(install.dataDir, ...PORT_FILE_RELATIVE)}.`;
+
+  const sandboxHint = (result.probes ?? []).every((p) => p.kind === "timeout")
+    ? "\nAll probes timed out without a refusal — likely a sandbox or firewall blocking localhost. Try running the runner unsandboxed."
+    : "";
+
+  const overrideHint = (result.probes ?? []).some((p) => p.kind === "refused")
+    ? "\nIf the real backend is on a different port, re-run with `--port=<port>` to target it directly."
+    : "";
+
+  const logHint = launchLogPath
+    ? `\nSpawn log: ${launchLogPath}.`
+    : "";
+
+  fail(
+    "not-running",
+    `Command Center backend not reachable (${phase}).\nProbes tried:\n${probeSummary}${portFileInfo}${sandboxHint}${overrideHint}${logHint}`,
+    EXIT.NOT_RUNNING,
+    {
+      phase,
+      probes: result.probes,
+      portFile: result.portFile,
+      launchLogPath,
+    },
+  );
 }
 
 // #######################################
@@ -523,6 +611,9 @@ async function checkModel(sessionToken) {
   const availability = await trpcCall({
     path: "models.getAvailability",
     type: "query",
+    // Backend schema is `z.object({ speed: zModelSpeed.default("fast") })` —
+    // the outer object is required. Send {} so the default kicks in.
+    input: {},
     sessionToken,
   });
   if (availability.state === "ok") return;
@@ -583,7 +674,39 @@ function runGit(args, cwd) {
   return stdout.trim();
 }
 
+// Wire sentinels the backend's zGeneralGitRef codec decodes — see
+// shared/src/git/git-types.ts (WORKING_TREE_STRING / STAGED_ONLY_STRING).
+const WORKING_TREE_REF = "__WORKING_TREE__";
+const STAGED_ONLY_REF = "__STAGED_ONLY__";
+
+// Translate friendly tokens like "WORKING_TREE" / "STAGED" into the wire
+// sentinels. Other strings (SHAs, branch names, "HEAD") pass through.
+function normalizeRef(token) {
+  if (!token) return token;
+  const upper = token.toUpperCase();
+  if (upper === "WORKING_TREE" || upper === "WORKING-TREE") {
+    return WORKING_TREE_REF;
+  }
+  if (
+    upper === "STAGED_ONLY" ||
+    upper === "STAGED-ONLY" ||
+    upper === "STAGED"
+  ) {
+    return STAGED_ONLY_REF;
+  }
+  return token;
+}
+
 function resolveRefs(argv, cwd) {
+  // Convenience flags. Equivalent ref syntax also accepted (see normalizeRef).
+  if (argv.includes("--working-tree")) {
+    const baseBranch = pickBaseBranch(cwd);
+    const mergeBase = runGit(["merge-base", "HEAD", baseBranch], cwd);
+    return { from: mergeBase, to: WORKING_TREE_REF };
+  }
+  if (argv.includes("--staged")) {
+    return { from: "HEAD", to: STAGED_ONLY_REF };
+  }
   // Accept either `from..to` or no argument (default to merge-base(HEAD, main)..HEAD).
   const arg = argv.find((a) => a.includes(".."));
   if (arg) {
@@ -591,7 +714,7 @@ function resolveRefs(argv, cwd) {
     if (!from || !to) {
       throw new Error(`Bad ref range "${arg}". Expected "<from>..<to>".`);
     }
-    return { from, to };
+    return { from: normalizeRef(from), to: normalizeRef(to) };
   }
   // Default: merge-base of HEAD and the most plausible base branch.
   const baseBranch = pickBaseBranch(cwd);
@@ -703,11 +826,37 @@ function globToRegex(glob) {
 }
 
 function listChangedFiles(cwd, from, to) {
-  const out = runGit(["diff", "--name-only", `${from}..${to}`], cwd);
-  return out
+  // Working-tree vs from: `git diff --name-only <from>` (no `..`). Picks
+  // up unstaged AND staged modifications of tracked files.
+  // Staged vs from: `git diff --name-only --cached <from>`.
+  // Committed range: `git diff --name-only <from>..<to>`.
+  const args =
+    to === WORKING_TREE_REF
+      ? ["diff", "--name-only", from]
+      : to === STAGED_ONLY_REF
+        ? ["diff", "--name-only", "--cached", from]
+        : ["diff", "--name-only", `${from}..${to}`];
+  return runGit(args, cwd)
     .split("\n")
     .map((s) => s.trim())
     .filter(Boolean);
+}
+
+// Manual port override. Useful when (a) the user has multiple CC instances
+// and the port file points at the wrong one, or (b) the runner can't write
+// CC_PORT_FILE_DIR (read-only data dir, etc.). Argument shape: `--port=6112`.
+function parsePortOverride(argv) {
+  const flag = argv.find((a) => a.startsWith("--port="));
+  if (!flag) return null;
+  const port = Number(flag.slice("--port=".length));
+  if (!Number.isInteger(port) || port <= 0 || port > 65535) {
+    fail(
+      "unexpected",
+      `Bad --port value: ${flag}. Expected a positive integer like --port=6112.`,
+      EXIT.GENERIC,
+    );
+  }
+  return `http://${BACKEND_HOST}:${port}`;
 }
 
 function resolveFiles(argv, cwd, from, to) {
@@ -879,7 +1028,7 @@ async function main() {
     hasElectron: install.hasElectron,
   });
 
-  await ensureRunning(install);
+  await ensureRunning(install, parsePortOverride(argv));
   await checkVersion();
 
   const sessionToken = await checkAuth(
