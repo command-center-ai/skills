@@ -16,10 +16,11 @@ import {
   mkdirSync,
   openSync,
   readFileSync,
+  realpathSync,
   statSync,
 } from "node:fs";
 import { homedir, platform } from "node:os";
-import { join, resolve as resolvePath } from "node:path";
+import { basename, join, resolve as resolvePath } from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
 
 // #######################################
@@ -640,22 +641,106 @@ async function checkModel(sessionToken) {
 // Workspace resolution
 // #######################################
 
-async function resolveWorkspace(sessionToken, cwd) {
+async function findWorkspaceId(sessionToken, cwd) {
   const result = await trpcCall({
     path: "projects.findWorkspaceByPath",
     type: "query",
     input: { path: cwd },
     sessionToken,
   });
-  if (!result) {
+  return result?.workspaceId ?? null;
+}
+
+// Canonicalize a path the same way the backend does for containment checks:
+// resolve symlinks (realpath), then apply the platform's path-key casing.
+// Falls back to a lexical resolve when the path doesn't exist on disk.
+function canonicalize(p) {
+  let resolved;
+  try {
+    resolved = realpathSync.native(resolvePath(p));
+  } catch {
+    resolved = resolvePath(p);
+  }
+  return platform() === "win32"
+    ? resolved.replaceAll("\\", "/").toLowerCase()
+    : resolved;
+}
+
+// Local mirror of the backend's findWorkspaceByContainingPath, run against the
+// overview a mutation returned. Used as a fallback for backends that still
+// match workspace paths lexically (pre-symlink-resolution).
+function pickContainingWorkspaceId(overview, cwd) {
+  const target = canonicalize(cwd);
+  let best = null;
+  for (const project of overview?.projects ?? []) {
+    for (const ws of project.workspaces ?? []) {
+      if (!ws?.absolutePath) continue;
+      const root = canonicalize(ws.absolutePath);
+      const contained = target === root || target.startsWith(root + "/");
+      if (!contained) continue;
+      if (!best || root.length > best.rootLen) {
+        best = { id: ws.id, rootLen: root.length };
+      }
+    }
+  }
+  return best?.id ?? null;
+}
+
+async function resolveWorkspace(sessionToken, cwd) {
+  const existing = await findWorkspaceId(sessionToken, cwd);
+  if (existing) return existing;
+
+  // Not inside any known workspace. Register the containing git repo as a
+  // project — addProject creates a root workspace pointing at the repo root —
+  // then resolve again. This mirrors "Open this directory as a workspace" in
+  // the app, so the skill is self-contained and doesn't dead-end the user.
+  let repoRoot;
+  try {
+    repoRoot = runGit(["rev-parse", "--show-toplevel"], cwd);
+  } catch (e) {
     fail(
       "no-workspace",
-      `No Command Center workspace contains "${cwd}". Open this directory as a workspace in Command Center first.`,
+      `No Command Center workspace contains "${cwd}", and it isn't inside a git repository, so the runner can't register it automatically (${e.message}). Open this directory as a workspace in Command Center first.`,
       EXIT.NO_WORKSPACE,
       { cwd },
     );
   }
-  return result.workspaceId;
+
+  status(`Registering ${repoRoot} as a Command Center workspace…`, { repoRoot });
+  let overview;
+  try {
+    overview = await trpcCall({
+      path: "projects.addProject",
+      type: "mutation",
+      input: { label: basename(repoRoot) || "Workspace", rootPath: repoRoot },
+      sessionToken,
+    });
+  } catch (e) {
+    fail(
+      "no-workspace",
+      `No Command Center workspace contains "${cwd}", and registering "${repoRoot}" as a workspace failed: ${e.message}`,
+      EXIT.NO_WORKSPACE,
+      { cwd, repoRoot },
+    );
+  }
+
+  // Preferred: a fresh lookup. Correct once the backend resolves symlinks when
+  // matching paths (root workspaces store their path as a symlink into the CC
+  // storage dir, which canonicalizes back to repoRoot).
+  const afterAdd = await findWorkspaceId(sessionToken, cwd);
+  if (afterAdd) return afterAdd;
+
+  // Fallback: resolve the containing workspace ourselves from the returned
+  // overview, for older backends that compare workspace paths lexically.
+  const fromOverview = pickContainingWorkspaceId(overview, cwd);
+  if (fromOverview) return fromOverview;
+
+  fail(
+    "no-workspace",
+    `Registered "${repoRoot}" as a Command Center workspace but still couldn't resolve "${cwd}" to it. This is unexpected — please report it.`,
+    EXIT.NO_WORKSPACE,
+    { cwd, repoRoot },
+  );
 }
 
 // #######################################
@@ -681,7 +766,8 @@ const WORKING_TREE_REF = "__WORKING_TREE__";
 const STAGED_ONLY_REF = "__STAGED_ONLY__";
 
 // Translate friendly tokens like "WORKING_TREE" / "STAGED" into the wire
-// sentinels. Other strings (SHAs, branch names, "HEAD") pass through.
+// sentinels. Everything else (SHAs, branch names, "HEAD", "HEAD~3", tags)
+// passes through untouched for resolveRefToWire to turn into a SHA.
 function normalizeRef(token) {
   if (!token) return token;
   const upper = token.toUpperCase();
@@ -698,15 +784,43 @@ function normalizeRef(token) {
   return token;
 }
 
+// Resolve a user-supplied ref token to the wire form the backend's
+// zGeneralGitRef codec accepts: a special sentinel, or a concrete 40-char
+// commit SHA (see shared/src/git/git-types.ts — GIT_SHA_REGEX). The codec
+// rejects symbolic refs (branch names, "HEAD", "HEAD~3", tags, short SHAs),
+// so anything that isn't a sentinel is resolved to a full SHA via git.
+// `^{commit}` peels tags to the commit they point at and forces a commit-ish.
+function resolveRefToWire(token, cwd) {
+  const normalized = normalizeRef(token);
+  if (normalized === WORKING_TREE_REF || normalized === STAGED_ONLY_REF) {
+    return normalized;
+  }
+  try {
+    return runGit(["rev-parse", "--verify", `${normalized}^{commit}`], cwd);
+  } catch (e) {
+    throw new Error(`Could not resolve git ref "${token}": ${e.message}`);
+  }
+}
+
 function resolveRefs(argv, cwd) {
   // Convenience flags. Equivalent ref syntax also accepted (see normalizeRef).
   if (argv.includes("--working-tree")) {
-    const baseBranch = pickBaseBranch(cwd);
-    const mergeBase = runGit(["merge-base", "HEAD", baseBranch], cwd);
-    return { from: mergeBase, to: WORKING_TREE_REF };
+    // No base branch (detached HEAD, single commit, no remote) → diff the
+    // working tree against HEAD itself. "Uncommitted changes vs HEAD" is
+    // unambiguous and useful even when there's nothing to merge-base against.
+    // Resolve to a concrete SHA: the wire ref codec rejects the literal
+    // "HEAD" (it wants a SHA or a sentinel), and a SHA also stays valid for
+    // the local `git diff` in listChangedFiles when --files is combined.
+    let from;
+    try {
+      from = runGit(["merge-base", "HEAD", pickBaseBranch(cwd)], cwd);
+    } catch {
+      from = runGit(["rev-parse", "HEAD"], cwd);
+    }
+    return { from, to: WORKING_TREE_REF };
   }
   if (argv.includes("--staged")) {
-    return { from: "HEAD", to: STAGED_ONLY_REF };
+    return { from: runGit(["rev-parse", "HEAD"], cwd), to: STAGED_ONLY_REF };
   }
   // Accept either `from..to` or no argument (default to merge-base(HEAD, main)..HEAD).
   const arg = argv.find((a) => a.includes(".."));
@@ -715,12 +829,12 @@ function resolveRefs(argv, cwd) {
     if (!from || !to) {
       throw new Error(`Bad ref range "${arg}". Expected "<from>..<to>".`);
     }
-    return { from: normalizeRef(from), to: normalizeRef(to) };
+    return { from: resolveRefToWire(from, cwd), to: resolveRefToWire(to, cwd) };
   }
   // Default: merge-base of HEAD and the most plausible base branch.
   const baseBranch = pickBaseBranch(cwd);
   const mergeBase = runGit(["merge-base", "HEAD", baseBranch], cwd);
-  return { from: mergeBase, to: "HEAD" };
+  return { from: mergeBase, to: runGit(["rev-parse", "HEAD"], cwd) };
 }
 
 function pickBaseBranch(cwd) {
