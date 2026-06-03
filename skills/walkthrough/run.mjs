@@ -47,10 +47,11 @@ let backendOrigin = null;
 
 // Minimum CC version that exposes the endpoints this skill requires
 // (walkthroughs.getTaskStatus, walkthroughs.create's `source` field,
-// projects.findWorkspaceByPath, models.getAvailability). Bump only when
-// adding a hard dependency on a new backend feature.
-// TODO: set to the first published CC release that includes these endpoints.
-const MIN_BACKEND_VERSION = "0.0.0";
+// projects.findWorkspaceByPath, models.getAvailability). The contract
+// landed in 1.0.0-rc0; `compareSemver` strips pre-release tags via
+// parseInt, so a baseline of "1.0.0" accepts every 1.0.0-rcN onward.
+// Bump only when adding a hard dependency on a new backend feature.
+const MIN_BACKEND_VERSION = "1.0.0";
 
 // How long to wait for the backend to come up after we launch it.
 // Electron path is local: a few seconds at most. Headless (npx) path may
