@@ -316,11 +316,14 @@ function launchHeadlessBackend(dataDir) {
     const logPath = join(runtimeDir, "skill-launch.log");
     const logFd = openSync(logPath, "a");
 
-    const cmd = platform() === "win32" ? "npx.cmd" : "npx";
+    const isWindows = platform() === "win32";
+    const cmd = isWindows ? "npx.cmd" : "npx";
+    // .cmd needs shell:true on Node 20.12+ (CVE-2024-27980) — else EINVAL
     spawn(cmd, ["-y", "@command-center/command-center", "--no-open"], {
       detached: true,
       stdio: ["ignore", logFd, logFd],
       env: { ...process.env, CC_PORT_FILE_DIR: runtimeDir },
+      shell: isWindows,
     }).unref();
     return { ok: true, logPath };
   } catch (err) {
