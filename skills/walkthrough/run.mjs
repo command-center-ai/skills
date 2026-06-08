@@ -146,6 +146,12 @@ function detectInstall() {
       join(
         process.env.LOCALAPPDATA ?? "",
         "Programs",
+        "Command Center",
+        "Command Center.exe",
+      ),
+      join(
+        process.env.LOCALAPPDATA ?? "",
+        "Programs",
         "command-center",
         "Command Center.exe",
       ),
