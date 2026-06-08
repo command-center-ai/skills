@@ -157,11 +157,11 @@ function detectInstall() {
     ],
   }[platform()] ?? [];
 
-  const hasElectron = electronPaths.some(
-    (p) => p && existsSync(p) && safeStat(p),
-  );
+  const electronPath =
+    electronPaths.find((p) => p && existsSync(p) && safeStat(p)) ?? null;
+  const hasElectron = electronPath !== null;
 
-  return { hasData, hasElectron, dataDir };
+  return { hasData, hasElectron, electronPath, dataDir };
 }
 
 function safeStat(p) {
@@ -240,7 +240,8 @@ async function waitForHealthy(dataDir, timeoutMs, override) {
   // Latest probe result per origin, used for the failure-summary message.
   const lastResult = new Map();
 
-  while (Date.now() < deadline) {
+  // do-while so timeoutMs=0 still gets one pass (fast-path "is it already up?")
+  do {
     const fromFile = discoverOrigin(dataDir);
 
     // Probe each candidate in priority order; first OK wins.
@@ -258,8 +259,9 @@ async function waitForHealthy(dataDir, timeoutMs, override) {
         return { ok: true, origin: c.origin };
       }
     }
+    if (Date.now() >= deadline) break;
     await sleep(HEALTH_POLL_INTERVAL_MS);
-  }
+  } while (Date.now() < deadline);
 
   return {
     ok: false,
@@ -268,15 +270,20 @@ async function waitForHealthy(dataDir, timeoutMs, override) {
   };
 }
 
-function launchElectron() {
+function launchElectron(install) {
   // OS-native "open by registered app". Detached + ignored stdio so we
   // don't keep the child glued to our process group.
+  // On Windows, spawn the resolved .exe directly — `start "" "Command Center"`
+  // surfaces a "Windows cannot find" dialog.
+  if (platform() === "win32") {
+    if (!install?.electronPath) return;
+    spawn(install.electronPath, [], { detached: true, stdio: "ignore" }).unref();
+    return;
+  }
   const cmd =
     platform() === "darwin"
       ? ["open", ["-a", "Command Center"]]
-      : platform() === "win32"
-        ? ["cmd", ["/c", "start", "", "Command Center"]]
-        : ["xdg-open", ["command-center://"]];
+      : ["xdg-open", ["command-center://"]];
   spawn(cmd[0], cmd[1], { detached: true, stdio: "ignore" }).unref();
 }
 
@@ -344,7 +351,7 @@ async function ensureRunning(install, override) {
   let launchLogPath = null;
   if (install.hasElectron) {
     status("Launching Command Center…");
-    launchElectron();
+    launchElectron(install);
   } else if (install.hasData) {
     const launched = launchHeadlessBackend(install.dataDir);
     if (!launched.ok) {
@@ -571,7 +578,7 @@ async function checkAuth(initialToken, install) {
 async function waitForSignIn(install, initialToken, probe) {
   if (install.hasElectron) {
     status("Opening Command Center to sign in…");
-    launchElectron();
+    launchElectron(install);
   } else {
     status(`Opening ${backendOrigin} to sign in…`, { signInUrl: backendOrigin });
     openUrl(backendOrigin);
