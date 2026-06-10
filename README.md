@@ -5,6 +5,7 @@ Public skills for [Command Center](https://up-to-speed.ai), usable from Claude C
 | Skill | What it does |
 |---|---|
 | `walkthrough` | Generate a Command Center walkthrough for the current diff and open it in the browser. |
+| `refactor` | Run a Command Center AI refactoring over the current diff; the result lands as uncommitted edits in the working tree. |
 
 ## Install
 
