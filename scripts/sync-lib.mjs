@@ -20,9 +20,23 @@ const repoRoot = join(dirname(fileURLToPath(import.meta.url)), "..");
 const LIB_NAME = "cc-skill-lib.mjs";
 const sourcePath = join(repoRoot, "lib", LIB_NAME);
 
-const BANNER = `// VENDORED COPY — DO NOT EDIT.
-// Source of truth: lib/${LIB_NAME} (this repo). Edit that file, then run
-// \`node scripts/sync-lib.mjs\` to refresh every skill's copy.
+// The banner must leave no doubt — for a reader of the repo, of an
+// installed skill on an end user's machine, or of a GitHub diff — that
+// this file is a machine-written copy:
+//   - "@generated" is the conventional machine-readable marker (GitHub's
+//     linguist also collapses the file in diffs via .gitattributes).
+//   - The provenance line names the source file AND the repo URL, because
+//     installed skills are copied out of this repo and "see sibling file"
+//     would be meaningless there.
+const BANNER = `// ⚠️ GENERATED FILE — DO NOT EDIT. ANY EDIT HERE WILL BE OVERWRITTEN. @generated
+//
+// This is a verbatim copy of lib/${LIB_NAME} from
+// https://github.com/command-center-ai/skills, written by scripts/sync-lib.mjs.
+// Each skill directory ships its own copy because the \`skills\` CLI installs
+// skill directories standalone.
+//
+// To change this code: edit lib/${LIB_NAME} in that repo, then run
+// \`node scripts/sync-lib.mjs\` to regenerate every skill's copy.
 
 `;
 

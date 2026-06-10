@@ -1,6 +1,12 @@
-// VENDORED COPY — DO NOT EDIT.
-// Source of truth: lib/cc-skill-lib.mjs (this repo). Edit that file, then run
-// `node scripts/sync-lib.mjs` to refresh every skill's copy.
+// ⚠️ GENERATED FILE — DO NOT EDIT. ANY EDIT HERE WILL BE OVERWRITTEN. @generated
+//
+// This is a verbatim copy of lib/cc-skill-lib.mjs from
+// https://github.com/command-center-ai/skills, written by scripts/sync-lib.mjs.
+// Each skill directory ships its own copy because the `skills` CLI installs
+// skill directories standalone.
+//
+// To change this code: edit lib/cc-skill-lib.mjs in that repo, then run
+// `node scripts/sync-lib.mjs` to regenerate every skill's copy.
 
 // Shared Command Center plumbing for skill runners.
 //
