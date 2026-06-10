@@ -14,6 +14,7 @@ const json = (res, value) => {
 const ok = (res, data) => json(res, { result: { data } });
 
 let cancelled = false;
+let walkthroughPolls = 0;
 
 createServer((req, res) => {
   const url = new URL(req.url, `http://127.0.0.1:${port}`);
@@ -64,6 +65,32 @@ createServer((req, res) => {
       ok(res, { taskId: "refactoring-task-0000", sessionId: "session-0000" });
     });
     return;
+  }
+
+  if (path === "/trpc/walkthroughs.create") {
+    let body = "";
+    req.on("data", (c) => (body += c));
+    req.on("end", () => {
+      console.error(`[mock] walkthrough create input: ${body}`);
+      ok(res, { taskId: "walkthrough-task-0000" });
+    });
+    return;
+  }
+
+  if (path === "/trpc/walkthroughs.getTaskStatus") {
+    // Drive the poll loop: running once, then a terminal state. `fail`
+    // mode ends in "failed" so the runner exits before opening a browser
+    // (handy on machines where the real CC app is installed).
+    walkthroughPolls += 1;
+    if (walkthroughPolls === 1) {
+      return ok(res, { status: "running", progress: { percentageDone: 40 } });
+    }
+    return ok(
+      res,
+      mode === "fail"
+        ? { status: "failed", error: "mock walkthrough failure" }
+        : { status: "completed", walkthroughId: "walkthrough-0000" },
+    );
   }
 
   if (path === "/trpc/refactoring.cancel") {

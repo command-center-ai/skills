@@ -12,6 +12,10 @@
   },
   "homepage": "https://github.com/command-center-ai/skills#readme",
   "type": "module",
+  "scripts": {
+    "sync-lib": "node scripts/sync-lib.mjs",
+    "check": "node scripts/sync-lib.mjs --check && node scripts/syntax-check.mjs"
+  },
   "engines": {
     "node": ">=18"
   },
