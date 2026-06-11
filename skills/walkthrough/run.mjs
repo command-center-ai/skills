@@ -15,6 +15,8 @@ import { setTimeout as sleep } from "node:timers/promises";
 import {
   EXIT as SHARED_EXIT,
   BackendError,
+  detectInstall,
+  ensureRunning,
   fail,
   getBackendOrigin,
   globToRegex,
@@ -214,6 +216,13 @@ function openWalkthrough({ install, walkthroughId, workspaceId }) {
 async function main() {
   const argv = process.argv.slice(2);
   const cwd = process.cwd();
+
+  // Debugging aid for multi-instance setups: resolve which backend this
+  // runner would talk to, report it, and exit without doing anything.
+  if (argv.includes("--discover")) {
+    await ensureRunning(detectInstall(), parsePortOverride(argv));
+    success({ backendOrigin: getBackendOrigin() });
+  }
 
   const { install, sessionToken, workspaceId } = await preflight({
     minVersion: MIN_BACKEND_VERSION,

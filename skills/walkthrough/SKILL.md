@@ -44,6 +44,7 @@ Both arguments are optional. By default the walkthrough covers **the whole diff*
 - `--working-tree` → diff merge-base-against-base to your current working tree (includes uncommitted edits).
 - `--staged` → `HEAD..STAGED` (just what's `git add`-ed).
 - `--port=<port>` → talk to a specific Command Center backend port. Useful when multiple CC instances run (developer environments) or when the runner can't auto-discover the right one.
+- `--discover` → just resolve and report which backend would be used (no other action). Useful for debugging multi-instance setups before committing to a run.
 
 **File filter** — `--files=PATTERN[,PATTERN...]`:
 - Comma-separated repo-relative globs. `*` matches non-slash chars; `**` matches across directories.
@@ -71,7 +72,7 @@ The runner prints one JSON object per line on stdout. Each line has a `kind` fie
 - `kind: "status"` — progress update; surface a brief one-line note to the user.
 - `kind: "result"` — terminal success; the runner has opened the walkthrough. Tell the user it opened and include the URL from `url`.
 - `kind: "error"` — terminal failure; tell the user what went wrong using the `code` and `message` fields. Codes are stable enums (`not-installed`, `not-running`, `not-logged-in`, `no-model`, `quota`, `no-workspace`, `backend-too-old`, `generation-failed`, etc.); the `message` is already in the user's language.
-- `kind: "action-required"` — the user must do something before re-running (e.g. install the app, sign in, configure a model). Surface the `message` and the `url` if present.
+- `kind: "action-required"` — the user must do something before re-running (e.g. install the app, sign in, configure a model). Surface the `message` and the `url` if present. A `multiple-backends` code means several Command Center instances are running and the runner can't tell which one the user is looking at — relay the listed instances (each tagged `production` or `development`) and re-run with `--port=<port>` once the user picks; if the user clearly means the desktop app, the `production` instance is the right one.
 
 Always surface the runner's `message` verbatim — do not rephrase. The runner produces user-facing strings in English; backend-originated strings are already localized.
 

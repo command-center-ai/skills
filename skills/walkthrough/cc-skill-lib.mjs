@@ -57,7 +57,17 @@ import { setTimeout as sleep } from "node:timers/promises";
 // port-discovery file the backend writes after binding (see
 // backend/src/utils/port-utils.ts).
 const BACKEND_HOST = "127.0.0.1";
-const DEFAULT_BACKEND_PORT = 6112;
+// SERVER_PORT mirrors the backend's own env override (see
+// backend/src/config/server-config.ts) for non-standard setups.
+const DEFAULT_BACKEND_PORT = Number(process.env.SERVER_PORT) || 6112;
+// When the preferred port is taken, the backend walks forward up to 10
+// ports (backend/src/utils/port-utils.ts findAvailablePort maxAttempts).
+// The scan window finds dev and hand-launched backends. NOTE: it cannot
+// find the packaged desktop app's backend — the app spawns it with
+// SERVER_PORT=0 (apps/electron/src/main.ts spawnBackend), i.e. a random
+// OS-assigned port. That one is found via the port file or, when the
+// file is stale, via the process list (see listeningBackendProcesses).
+const PORT_SCAN_WINDOW = 10;
 const PORT_FILE_RELATIVE = ["runtime", ".backend-port"];
 const TRPC_PREFIX = "/trpc";
 const SESSION_HEADER = "x-session-token";
@@ -103,6 +113,8 @@ export const EXIT = {
   QUOTA: 7,
   NO_WORKSPACE: 8,
   NO_FILES_MATCHED: 10,
+  // 9 and 11–13 are skill-specific.
+  AMBIGUOUS_BACKEND: 14,
 };
 
 // #######################################
@@ -230,19 +242,24 @@ function discoverOrigin(dataDir) {
   }
 }
 
-const DEFAULT_ORIGIN = `http://${BACKEND_HOST}:${DEFAULT_BACKEND_PORT}`;
-
 // Tagged result so callers can tell the failure modes apart in error
 // messages: "nothing listening" (ECONNREFUSED) is a different signal
-// from "we got blocked" (sandbox / firewall / timeout).
+// from "we got blocked" (sandbox / firewall / timeout). On success,
+// `environment` ("development" | "production") identifies what kind of
+// instance answered — the production Electron app vs. a dev server.
 async function pingHealth(origin) {
   try {
     const res = await fetch(`${origin}/health`, {
       signal: AbortSignal.timeout(2_000),
     });
-    return res.ok
-      ? { kind: "ok" }
-      : { kind: "http-error", status: res.status };
+    if (!res.ok) return { kind: "http-error", status: res.status };
+    let environment;
+    try {
+      environment = (await res.json())?.environment;
+    } catch {
+      // Health responded OK but with a non-JSON body — still a backend.
+    }
+    return { kind: "ok", environment };
   } catch (err) {
     // Node 18+ surfaces the underlying error code on .cause for fetch
     // failures: ECONNREFUSED, ENETUNREACH, ETIMEDOUT, etc.
@@ -255,43 +272,294 @@ async function pingHealth(origin) {
   }
 }
 
-// Resolve a healthy origin. Prefer (a) any explicit override, (b) the
-// port the backend advertised in its port file, (c) the default port
-// for hand-launched instances. Returns the resolved origin, or a probe
-// summary describing what we tried and how each probe failed.
-async function waitForHealthy(dataDir, timeoutMs, override) {
-  const deadline = Date.now() + timeoutMs;
-  // Latest probe result per origin, used for the failure-summary message.
-  const lastResult = new Map();
+// #######################################
+// Process-based backend discovery
+// #######################################
+//
+// The packaged desktop app's backend listens on a random port, so when
+// the port file is stale the only way to find it is the process table:
+// list listening sockets, resolve each owner's command line, and keep
+// the ones that look like Command Center backends. Patterns can be
+// loose because every hit is still health-probed before use.
 
-  // do-while so timeoutMs=0 still gets one pass (fast-path "is it already up?")
-  do {
-    const fromFile = discoverOrigin(dataDir);
+// Any Command Center backend flavor:
+//   - packaged (binary `command-center` inside the app's resources)
+//   - headless (same binary name, npm cache)
+//   - dev source mode (`bun backend/src/server-simple.ts`)
+const CC_PROCESS_PATTERNS = [
+  /Command Center\.app/i, // macOS bundle
+  /[\\/]command-center(\.exe)?(\s|$)/i,
+  /server-simple/i,
+];
 
-    // Probe each candidate in priority order; first OK wins.
-    const candidates = [];
-    if (override) candidates.push({ origin: override, source: "override" });
-    if (fromFile) {
-      candidates.push({ origin: fromFile.origin, source: "port-file" });
+// Specifically the DESKTOP APP's own backend — the binary the Electron
+// app ships and spawns (apps/electron resolveBackendBinaryPath). Used to
+// break ties in favor of the instance whose window the user is looking at.
+const APP_OWNED_PATTERNS = [
+  /Command Center\.app/i,
+  /[\\/]resources[\\/]backend[\\/]command-center(\.exe)?/i,
+];
+
+function runCmd(cmd, args, timeoutMs = 5_000) {
+  try {
+    const { status: code, stdout } = spawnSync(cmd, args, {
+      encoding: "utf8",
+      timeout: timeoutMs,
+    });
+    return code === 0 ? stdout : null;
+  } catch {
+    return null;
+  }
+}
+
+// Returns [{ port, pid, command }] for listening processes that look
+// like CC backends. Best-effort: any failure (lsof/netstat missing,
+// sandbox blocking process info) degrades to []. Set
+// CC_SKILL_PROCESS_DISCOVERY=0 to disable outright (hermetic tests,
+// locked-down environments).
+function listeningBackendProcesses() {
+  if (process.env.CC_SKILL_PROCESS_DISCOVERY === "0") return [];
+  try {
+    const listeners =
+      platform() === "win32" ? listListenersWindows() : listListenersPosix();
+    return listeners.filter(
+      (l) => l.command && CC_PROCESS_PATTERNS.some((re) => re.test(l.command)),
+    );
+  } catch {
+    return [];
+  }
+}
+
+function listListenersPosix() {
+  // lsof shows the current user's own processes without root — CC runs
+  // as the same user as the skill. COMMAND in lsof output is truncated,
+  // so full command lines come from a second batched ps call.
+  const out = runCmd("lsof", ["-nP", "-iTCP", "-sTCP:LISTEN"]);
+  if (!out) return [];
+  const pidPorts = []; // [{pid, port}]
+  for (const row of out.split("\n").slice(1)) {
+    const cols = row.trim().split(/\s+/);
+    if (cols.length < 9) continue;
+    const pid = Number(cols[1]);
+    // NAME is like "127.0.0.1:6112" / "[::1]:6112" / "*:6112".
+    const name = cols[8];
+    const port = Number(name.slice(name.lastIndexOf(":") + 1));
+    if (!Number.isInteger(pid) || !Number.isInteger(port) || port <= 0) {
+      continue;
     }
-    candidates.push({ origin: DEFAULT_ORIGIN, source: "default-port" });
+    pidPorts.push({ pid, port });
+  }
+  if (pidPorts.length === 0) return [];
 
-    for (const c of candidates) {
-      const result = await pingHealth(c.origin);
-      lastResult.set(c.origin, { ...c, ...result });
-      if (result.kind === "ok") {
-        return { ok: true, origin: c.origin };
-      }
-    }
-    if (Date.now() >= deadline) break;
-    await sleep(HEALTH_POLL_INTERVAL_MS);
-  } while (Date.now() < deadline);
+  const uniquePids = [...new Set(pidPorts.map((l) => l.pid))];
+  const psOut = runCmd("ps", ["-ww", "-o", "pid=,command=", "-p", uniquePids.join(",")]);
+  if (!psOut) return [];
+  const commands = new Map();
+  for (const line of psOut.split("\n")) {
+    const m = line.match(/^\s*(\d+)\s+(.*)$/);
+    if (m) commands.set(Number(m[1]), m[2]);
+  }
+  return pidPorts.map((l) => ({ ...l, command: commands.get(l.pid) ?? null }));
+}
 
-  return {
-    ok: false,
-    portFile: discoverOrigin(dataDir), // for surfacing mtime/pid
-    probes: [...lastResult.values()],
+function listListenersWindows() {
+  // `netstat -o` (PID column) needs no elevation — only `-b` does.
+  const out = runCmd("netstat", ["-ano", "-p", "tcp"]);
+  if (!out) return [];
+  const pidPorts = [];
+  for (const row of out.split("\n")) {
+    // "  TCP    127.0.0.1:6112    0.0.0.0:0    LISTENING    1234"
+    // Listening rows are identified structurally — by the all-zero
+    // foreign address — NOT by the state word, which netstat localizes
+    // ("LISTENING" on English Windows, "ABHÖREN" on German, …).
+    const m = row.match(
+      /^\s*TCP\s+\S+:(\d+)\s+(?:0\.0\.0\.0:0|\[::\]:0)\s+\S+\s+(\d+)\s*$/,
+    );
+    if (m) pidPorts.push({ port: Number(m[1]), pid: Number(m[2]) });
+  }
+  if (pidPorts.length === 0) return [];
+
+  // CommandLine is visible without elevation for same-user processes —
+  // which CC is. Generous timeout: PowerShell cold start (plus AV
+  // scanning) can take several seconds.
+  const json = runCmd(
+    "powershell.exe",
+    [
+      "-NoProfile",
+      "-Command",
+      "Get-CimInstance Win32_Process | Select-Object ProcessId,CommandLine,ExecutablePath | ConvertTo-Json -Compress",
+    ],
+    15_000,
+  );
+  if (!json) return [];
+  let procs;
+  try {
+    procs = JSON.parse(json);
+  } catch {
+    return [];
+  }
+  const commands = new Map();
+  for (const p of Array.isArray(procs) ? procs : [procs]) {
+    commands.set(p.ProcessId, p.CommandLine ?? p.ExecutablePath ?? null);
+  }
+  return pidPorts.map((l) => ({ ...l, command: commands.get(l.pid) ?? null }));
+}
+
+// Is the process that wrote the port file still alive? Signal 0 probes
+// without sending; EPERM means "alive but not ours", which still counts.
+function pidAlive(pid) {
+  if (typeof pid !== "number" || pid <= 0) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (e) {
+    return e?.code === "EPERM";
+  }
+}
+
+// One probe pass over every place a Command Center backend can live.
+//
+// Multiple backends genuinely coexist on developer machines (the
+// production Electron app plus a dev server), and picking the wrong one
+// silently is worse than asking: the refactoring/walkthrough would run
+// on a backend whose UI the user isn't looking at. Resolution rules:
+//   - An explicit --port override is probed ALONE — it never falls
+//     through to other instances.
+//   - The port file is the pointer the Electron-managed backend writes
+//     at startup, so it wins — but only when the pid that wrote it is
+//     still alive. A stale file (dead pid) must not bless whatever
+//     process later squatted on its port.
+//   - With no valid blessing, the process table fills the gap: the
+//     packaged app's backend sits on a RANDOM port the scan can't see,
+//     so listening CC-backend processes join the candidate set, and a
+//     backend owned by the desktop app's own binary wins ties.
+//   - Still unresolved: exactly one live backend → use it; several →
+//     ambiguous, the caller asks the user to pick via --port.
+//
+// Returns {kind:"ok", origin, source, environment, others} |
+//         {kind:"ambiguous", healthy} |
+//         {kind:"none", probes}.
+async function probeBackends(dataDir, override) {
+  if (override) {
+    const result = await pingHealth(override);
+    return result.kind === "ok"
+      ? { kind: "ok", origin: override, source: "override", environment: result.environment, others: [] }
+      : { kind: "none", probes: [{ origin: override, source: "override", ...result }] };
+  }
+
+  const portFile = discoverOrigin(dataDir);
+
+  const candidates = new Map(); // origin → {source, command}
+  if (portFile) candidates.set(portFile.origin, { source: "port-file" });
+  for (let i = 0; i < PORT_SCAN_WINDOW; i++) {
+    const origin = `http://${BACKEND_HOST}:${DEFAULT_BACKEND_PORT + i}`;
+    if (!candidates.has(origin)) candidates.set(origin, { source: "port-scan" });
+  }
+
+  const probe = (origin, meta) =>
+    pingHealth(origin).then((r) => ({ origin, ...meta, ...r }));
+
+  let probes = await Promise.all(
+    [...candidates].map(([origin, meta]) => probe(origin, meta)),
+  );
+  let healthy = probes.filter((p) => p.kind === "ok");
+
+  const blessOrNull = () => {
+    if (!portFile || !pidAlive(portFile.pid)) return null;
+    const blessed = healthy.find((p) => p.origin === portFile.origin);
+    return blessed
+      ? { ...blessed, source: "port-file", others: healthy.filter((p) => p !== blessed) }
+      : null;
   };
+
+  // Fast path: a live port file is the app's own pointer — no need to
+  // touch the process table.
+  const blessed = blessOrNull();
+  if (blessed) return blessed;
+
+  // No valid blessing → consult the process table. This both finds
+  // random-port backends the scan missed and attaches command lines to
+  // already-probed origins for the app-ownership tie-break.
+  const listeners = listeningBackendProcesses();
+  const byPort = new Map(listeners.map((l) => [l.port, l]));
+  for (const p of probes) {
+    p.command ??= byPort.get(Number(new URL(p.origin).port))?.command ?? null;
+  }
+  const newOrigins = listeners
+    .map((l) => ({ origin: `http://${BACKEND_HOST}:${l.port}`, command: l.command }))
+    .filter((l) => !candidates.has(l.origin));
+  if (newOrigins.length > 0) {
+    const extra = await Promise.all(
+      newOrigins.map((l) => probe(l.origin, { source: "process", command: l.command })),
+    );
+    probes = probes.concat(extra);
+    healthy = probes.filter((p) => p.kind === "ok");
+  }
+
+  if (healthy.length === 0) return { kind: "none", probes };
+  if (healthy.length === 1) return { ...healthy[0], others: [] };
+
+  // Several live backends: prefer the one owned by the desktop app's
+  // own binary — that's the window the user is looking at.
+  const appOwned = healthy.filter(
+    (p) => p.command && APP_OWNED_PATTERNS.some((re) => re.test(p.command)),
+  );
+  if (appOwned.length === 1) {
+    return {
+      ...appOwned[0],
+      source: "app-process",
+      others: healthy.filter((p) => p !== appOwned[0]),
+    };
+  }
+
+  return { kind: "ambiguous", healthy };
+}
+
+function describeBackend(p) {
+  const how =
+    p.source === "port-file"
+      ? ", via port file"
+      : p.source === "override"
+        ? ", via --port"
+        : p.source === "app-process"
+          ? ", the desktop app's own backend"
+          : p.source === "process"
+            ? ", found via process list"
+            : "";
+  return `${p.origin} (${p.environment ?? "unknown environment"}${how})`;
+}
+
+function adoptBackend(found) {
+  backendOrigin = found.origin;
+  const ignored = found.others.map(describeBackend).join(", ");
+  status(
+    `Connected to Command Center at ${describeBackend(found)}.` +
+      (ignored
+        ? ` Other live backends ignored: ${ignored} — pass --port to target one of those instead.`
+        : ""),
+    {
+      backendOrigin: found.origin,
+      environment: found.environment,
+      source: found.source,
+      ignoredBackends: found.others.map((p) => p.origin),
+    },
+  );
+}
+
+function failAmbiguous(found) {
+  const list = found.healthy.map((p) => `  - ${describeBackend(p)}`).join("\n");
+  actionRequired(
+    "multiple-backends",
+    `Multiple Command Center backends are running, and none is identifiable as the desktop app's own (its port file is stale or missing):\n${list}\nRe-run with --port=<port> to pick the instance whose window you're actually using. "production" is usually the desktop app; "development" is a dev server.`,
+    {
+      backends: found.healthy.map(({ origin, environment, source }) => ({
+        origin,
+        environment,
+        source,
+      })),
+    },
+  );
+  process.exit(EXIT.AMBIGUOUS_BACKEND);
 }
 
 function launchElectron(install) {
@@ -348,16 +616,10 @@ function launchHeadlessBackend(dataDir) {
 }
 
 export async function ensureRunning(install, override) {
-  // Fast path: backend already up. waitForHealthy with a zero deadline
-  // does one pass through (override → port-file → default-port).
-  const fast = await waitForHealthy(install.dataDir, 0, override);
-  if (fast.ok) {
-    backendOrigin = fast.origin;
-    status(`Found running Command Center at ${fast.origin}.`, {
-      backendOrigin: fast.origin,
-    });
-    return;
-  }
+  // Fast path: a backend is already up and unambiguously identifiable.
+  const fast = await probeBackends(install.dataDir, override);
+  if (fast.kind === "ok") return adoptBackend(fast);
+  if (fast.kind === "ambiguous") failAmbiguous(fast);
 
   // With an explicit override, the user expects us to use that specific
   // backend — don't auto-spawn another one.
@@ -392,44 +654,60 @@ export async function ensureRunning(install, override) {
   }
 
   status("Waiting for Command Center backend…");
-  const result = await waitForHealthy(install.dataDir, timeoutMs, override);
-  if (!result.ok) {
-    surfaceUnreachable(result, install, "launch", launchLogPath);
-    process.exit(EXIT.NOT_RUNNING);
+  const deadline = Date.now() + timeoutMs;
+  let last = fast;
+  while (Date.now() < deadline) {
+    await sleep(HEALTH_POLL_INTERVAL_MS);
+    last = await probeBackends(install.dataDir, override);
+    if (last.kind === "ok") return adoptBackend(last);
+    // "ambiguous" mid-launch usually means the just-launched backend
+    // hasn't written its port file yet — keep waiting for the blessing
+    // to appear rather than failing early.
   }
-  backendOrigin = result.origin;
-  status(`Backend ready at ${result.origin}.`, { backendOrigin: result.origin });
+  if (last.kind === "ambiguous") failAmbiguous(last);
+  surfaceUnreachable(last, install, "launch", launchLogPath);
+  process.exit(EXIT.NOT_RUNNING);
 }
 
 // Format an unreachable-backend failure so the error message and the
 // structured data both carry enough detail to diagnose multi-instance
-// dev setups, sandbox/firewall blocks, and stale port files.
+// dev setups, sandbox/firewall blocks, and stale port files. Plain
+// "nothing listening" refusals are collapsed into one line — with the
+// port scan they'd otherwise drown out the informative probes.
 function surfaceUnreachable(result, install, phase, launchLogPath) {
-  const probeSummary = (result.probes ?? [])
-    .map((p) => {
-      const tag =
-        p.kind === "refused"
-          ? "ECONNREFUSED (nothing listening)"
-          : p.kind === "timeout"
-            ? "timeout (sandbox / firewall?)"
-            : p.kind === "http-error"
-              ? `HTTP ${p.status}`
-              : p.kind === "error"
-                ? `${p.code}`
-                : p.kind;
-      return `  - ${p.origin} (${p.source}): ${tag}`;
-    })
-    .join("\n");
+  const probes = result.probes ?? [];
+  const refused = probes.filter((p) => p.kind === "refused");
+  const notable = probes.filter((p) => p.kind !== "refused");
+  const probeLines = notable.map((p) => {
+    const tag =
+      p.kind === "timeout"
+        ? "timeout (sandbox / firewall?)"
+        : p.kind === "http-error"
+          ? `HTTP ${p.status}`
+          : p.kind === "error"
+            ? `${p.code}`
+            : p.kind;
+    return `  - ${p.origin} (${p.source}): ${tag}`;
+  });
+  if (refused.length > 0) {
+    const ports = refused
+      .map((p) => new URL(p.origin).port)
+      .sort((a, b) => a - b)
+      .join(", ");
+    probeLines.push(`  - nothing listening on port${refused.length === 1 ? "" : "s"} ${ports}`);
+  }
+  const probeSummary = probeLines.join("\n");
+  const portFileInfoData = discoverOrigin(install.dataDir);
 
-  const portFileInfo = result.portFile
-    ? `\nPort file: ${result.portFile.file} → :${result.portFile.port} (written ${result.portFile.mtimeIso}${result.portFile.pid ? `, pid ${result.portFile.pid}` : ""}).`
+  const portFileInfo = portFileInfoData
+    ? `\nPort file: ${portFileInfoData.file} → :${portFileInfoData.port} (written ${portFileInfoData.mtimeIso}${portFileInfoData.pid ? `, pid ${portFileInfoData.pid}${pidAlive(portFileInfoData.pid) ? " (alive)" : " (dead — stale file)"}` : ""}).`
     : `\nPort file: not present at ${join(install.dataDir, ...PORT_FILE_RELATIVE)}.`;
 
-  const sandboxHint = (result.probes ?? []).every((p) => p.kind === "timeout")
+  const sandboxHint = probes.every((p) => p.kind === "timeout")
     ? "\nAll probes timed out without a refusal — likely a sandbox or firewall blocking localhost. Try running the runner unsandboxed."
     : "";
 
-  const overrideHint = (result.probes ?? []).some((p) => p.kind === "refused")
+  const overrideHint = refused.length > 0
     ? "\nIf the real backend is on a different port, re-run with `--port=<port>` to target it directly."
     : "";
 
@@ -443,8 +721,8 @@ function surfaceUnreachable(result, install, phase, launchLogPath) {
     EXIT.NOT_RUNNING,
     {
       phase,
-      probes: result.probes,
-      portFile: result.portFile,
+      probes,
+      portFile: portFileInfoData,
       launchLogPath,
     },
   );

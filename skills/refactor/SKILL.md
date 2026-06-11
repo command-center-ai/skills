@@ -56,6 +56,7 @@ All arguments are optional. By default the runner refactors **every changed file
 - `--files=PATTERN[,PATTERN...]` → narrow to a subset of the changed files. Comma-separated repo-relative globs; `*` matches non-slash chars, `**` crosses directories, a `!` prefix excludes. If you pass only exclusions, the implicit include is `**`.
 - `--timeout-mins=<n>` → how long to wait for the refactoring to finish (default 60). On timeout the refactoring keeps running in Command Center.
 - `--port=<port>` → talk to a specific Command Center backend port. Useful when multiple CC instances run (developer environments) or when the runner can't auto-discover the right one.
+- `--discover` → just resolve and report which backend would be used (no other action). Useful for debugging multi-instance setups before committing to a run.
 
 Note: Command Center additionally screens the file list down to reasonably-sized code files — lockfiles, generated files, and very large files are skipped automatically.
 
@@ -77,7 +78,7 @@ The runner prints one JSON object per line on stdout. Each line has a `kind` fie
 - `kind: "status"` — progress update (including `percentageDone` while refactoring); surface a brief one-line note to the user.
 - `kind: "result"` — terminal success. The refactored code is now **uncommitted in the working tree**. The payload includes `dirtyFiles` (re-read these yourself before further edits), `filesSubmitted`, and the Command Center `sessionId`. Tell the user it finished and to review the changes **in Command Center**: the refactoring session in the app's Agents panel explains each change alongside its diff. Do not tell the user to review with raw `git diff` — Command Center is the review surface; `dirtyFiles` is for your own bookkeeping.
 - `kind: "error"` — terminal failure; tell the user what went wrong using the `code` and `message` fields. Codes are stable enums (`not-installed`, `not-running`, `not-logged-in`, `no-model`, `no-agent`, `quota`, `no-workspace`, `no-files-matched`, `no-eligible-files`, `backend-too-old`, `refactoring-failed`, `refactoring-cancelled`, etc.); the `message` is already in the user's language.
-- `kind: "action-required"` — the user must do something before re-running (e.g. install the app, sign in, configure a model or coding agent). Surface the `message` and the `url` if present.
+- `kind: "action-required"` — the user must do something before re-running (e.g. install the app, sign in, configure a model or coding agent). Surface the `message` and the `url` if present. A `multiple-backends` code means several Command Center instances are running and the runner can't tell which one the user is looking at — relay the listed instances (each tagged `production` or `development`) and re-run with `--port=<port>` once the user picks; if the user clearly means the desktop app, the `production` instance is the right one.
 
 Always surface the runner's `message` verbatim — do not rephrase. The runner produces user-facing strings in English; backend-originated strings are already localized.
 

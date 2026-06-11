@@ -21,8 +21,11 @@ import {
   EXIT as SHARED_EXIT,
   BackendError,
   actionRequired,
+  detectInstall,
   emit,
+  ensureRunning,
   fail,
+  getBackendOrigin,
   globToRegex,
   listChangedFiles,
   parsePatternSpec,
@@ -373,6 +376,13 @@ async function main() {
   const cwd = process.cwd();
 
   installSignalHandlers();
+
+  // Debugging aid for multi-instance setups: resolve which backend this
+  // runner would talk to, report it, and exit without doing anything.
+  if (argv.includes("--discover")) {
+    await ensureRunning(detectInstall(), parsePortOverride(argv));
+    success({ backendOrigin: getBackendOrigin() });
+  }
 
   const workflowType = parseWorkflow(argv);
   const timeoutMs = parseTimeoutMs(argv);

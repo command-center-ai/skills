@@ -21,7 +21,12 @@ createServer((req, res) => {
   const path = url.pathname;
   console.error(`[mock] ${req.method} ${path}`);
 
-  if (path === "/health") return json(res, { status: "ok" });
+  if (path === "/health")
+    return json(res, {
+      status: "ok",
+      environment: process.env.MOCK_ENV ?? "production",
+      port,
+    });
   if (path === "/trpc/version.currentVersion")
     return ok(res, { currentVersion: "1.0.0" });
   if (path === "/trpc/auth.getStatus")
