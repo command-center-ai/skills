@@ -5,7 +5,7 @@
 import { createServer } from "node:http";
 
 const port = Number(process.argv[2] ?? 7999);
-const mode = process.argv[3] ?? "ok"; // ok | fail | cancel | lost
+const mode = process.argv[3] ?? "ok"; // ok | fail | cancel | lost | quiet
 
 const json = (res, value) => {
   res.writeHead(200, { "content-type": "application/json" });
@@ -114,6 +114,22 @@ createServer((req, res) => {
       // Unknown task: generator yields nothing and returns.
       send([`event: return`, `data: `]);
       return res.end();
+    }
+    if (mode === "quiet") {
+      // One early progress event, then nothing but pings until done —
+      // simulates a long workflow step (exercises runner heartbeats).
+      send([`data: ${JSON.stringify({ status: "running", progress: { percentageDone: 10 } })}`]);
+      let ticks = 0;
+      const quietTick = setInterval(() => {
+        ticks += 1;
+        if (ticks < 8) return send([`event: ping`, `data: `]);
+        send([`data: ${JSON.stringify({ status: "completed", endedAt: 1 })}`]);
+        clearInterval(quietTick);
+        send([`event: return`, `data: `]);
+        res.end();
+      }, Number(process.env.MOCK_TICK_MS ?? 300));
+      req.on("close", () => clearInterval(quietTick));
+      return;
     }
     let pct = 0;
     const tick = setInterval(() => {

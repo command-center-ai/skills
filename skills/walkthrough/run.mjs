@@ -48,6 +48,12 @@ const TASK_POLL_INTERVAL_MS = 1_000;
 // tens of seconds; this cap is just a safety net.
 const TASK_TIMEOUT_MS = 10 * 60 * 1_000;
 
+// Emit a proof-of-life status when generation sits at one percentage
+// this long (large diffs can hold a step for minutes). Env override is
+// for tests.
+const HEARTBEAT_INTERVAL_MS =
+  Number(process.env.CC_SKILL_HEARTBEAT_MS) || 60_000;
+
 // Shared codes 0–8 and 10, plus this skill's own failure kind.
 const EXIT = {
   ...SHARED_EXIT,
@@ -133,8 +139,10 @@ async function createWalkthrough({
 }
 
 async function waitForCompletion({ sessionToken, workspaceId, taskId }) {
-  const deadline = Date.now() + TASK_TIMEOUT_MS;
+  const startedAt = Date.now();
+  const deadline = startedAt + TASK_TIMEOUT_MS;
   let lastPct = -1;
+  let lastEmitAt = Date.now();
   while (Date.now() < deadline) {
     const state = await trpcCall({
       path: "walkthroughs.getTaskStatus",
@@ -158,6 +166,14 @@ async function waitForCompletion({ sessionToken, workspaceId, taskId }) {
       if (pct !== lastPct) {
         status(`Generating walkthrough… ${pct}%`, { percentageDone: pct });
         lastPct = pct;
+        lastEmitAt = Date.now();
+      } else if (Date.now() - lastEmitAt >= HEARTBEAT_INTERVAL_MS) {
+        const mins = Math.round((Date.now() - startedAt) / 60_000);
+        status(
+          `Walkthrough still generating — ${mins} min elapsed, last reported progress ${Math.max(lastPct, 0)}%.`,
+          { percentageDone: Math.max(lastPct, 0), elapsedMinutes: mins, heartbeat: true },
+        );
+        lastEmitAt = Date.now();
       }
     } else if (state.status === "completed") {
       return state.walkthroughId;

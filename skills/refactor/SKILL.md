@@ -18,8 +18,8 @@ The user asks to refactor recent changes using Command Center — the current br
 ## Before invoking — important
 
 1. **The refactoring edits the working tree.** Do not edit files in the repo while the runner is waiting, and re-read any files you have cached once it finishes (the result lists exactly which files are dirty).
-2. **Prefer a committed baseline.** If there is meaningful uncommitted work, suggest committing it first so the refactoring's edits stay cleanly separable — and revertible. Not a hard requirement — `--working-tree` exists for refactoring uncommitted changes deliberately.
-3. **It takes a while.** Typically minutes, up to tens of minutes for large diffs. Run it in the background if your harness supports that, and surface the runner's progress lines to the user.
+2. **Prefer a committed baseline.** If there is meaningful uncommitted work, suggest committing it first so the refactoring is cleanly reviewable (and revertible) as `git diff`. Not a hard requirement — `--working-tree` exists for refactoring uncommitted changes deliberately.
+3. **It takes a while — don't busy-poll.** Typically minutes, up to tens of minutes for large diffs, and progress only updates between workflow steps, so quiet stretches of 10+ minutes are normal. The runner emits a heartbeat status line about once a minute during those stretches as proof of life. Run it in the background if your harness supports that, check on it at multi-minute intervals, and don't narrate every empty check to the user — relay progress lines when they appear.
 
 ## How to invoke
 
@@ -74,8 +74,8 @@ Examples — pick whichever matches the user's intent:
 
 The runner prints one JSON object per line on stdout. Each line has a `kind` field:
 
-- `kind: "status"` — progress update (including `percentageDone` while refactoring); surface a brief one-line note to the user.
-- `kind: "result"` — terminal success. The refactored code is now **uncommitted in the working tree**. The payload includes `dirtyFiles` (re-read these yourself before further edits), `filesSubmitted`, and the Command Center `sessionId`. Tell the user it finished and to review the changes **in Command Center**: the refactoring session in the app's Agents panel explains each change alongside its diff. Do not tell the user to review with raw `git diff` — Command Center is the review surface; `dirtyFiles` is for your own bookkeeping.
+- `kind: "status"` — progress update (including `percentageDone` while refactoring); surface a brief one-line note to the user. Lines with `heartbeat: true` are periodic proof-of-life during long quiet stretches — no per-line narration needed; silence between heartbeats does not indicate a hang.
+- `kind: "result"` — terminal success. The refactored code is now **uncommitted in the working tree**. The payload includes `dirtyFiles` (re-read these before further edits), `filesSubmitted`, and the Command Center `sessionId` whose session contains per-change explanations. Tell the user it finished and suggest reviewing with `git diff`.
 - `kind: "error"` — terminal failure; tell the user what went wrong using the `code` and `message` fields. Codes are stable enums (`not-installed`, `not-running`, `not-logged-in`, `no-model`, `no-agent`, `quota`, `no-workspace`, `no-files-matched`, `no-eligible-files`, `backend-too-old`, `refactoring-failed`, `refactoring-cancelled`, etc.); the `message` is already in the user's language.
 - `kind: "action-required"` — the user must do something before re-running (e.g. install the app, sign in, configure a model or coding agent). Surface the `message` and the `url` if present.
 
