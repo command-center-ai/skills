@@ -300,11 +300,11 @@ const APP_OWNED_PATTERNS = [
   /[\\/]resources[\\/]backend[\\/]command-center(\.exe)?/i,
 ];
 
-function runCmd(cmd, args) {
+function runCmd(cmd, args, timeoutMs = 5_000) {
   try {
     const { status: code, stdout } = spawnSync(cmd, args, {
       encoding: "utf8",
-      timeout: 5_000,
+      timeout: timeoutMs,
     });
     return code === 0 ? stdout : null;
   } catch {
@@ -363,21 +363,34 @@ function listListenersPosix() {
 }
 
 function listListenersWindows() {
+  // `netstat -o` (PID column) needs no elevation — only `-b` does.
   const out = runCmd("netstat", ["-ano", "-p", "tcp"]);
   if (!out) return [];
   const pidPorts = [];
   for (const row of out.split("\n")) {
     // "  TCP    127.0.0.1:6112    0.0.0.0:0    LISTENING    1234"
-    const m = row.match(/^\s*TCP\s+\S+:(\d+)\s+\S+\s+LISTENING\s+(\d+)\s*$/i);
+    // Listening rows are identified structurally — by the all-zero
+    // foreign address — NOT by the state word, which netstat localizes
+    // ("LISTENING" on English Windows, "ABHÖREN" on German, …).
+    const m = row.match(
+      /^\s*TCP\s+\S+:(\d+)\s+(?:0\.0\.0\.0:0|\[::\]:0)\s+\S+\s+(\d+)\s*$/,
+    );
     if (m) pidPorts.push({ port: Number(m[1]), pid: Number(m[2]) });
   }
   if (pidPorts.length === 0) return [];
 
-  const json = runCmd("powershell.exe", [
-    "-NoProfile",
-    "-Command",
-    "Get-CimInstance Win32_Process | Select-Object ProcessId,CommandLine,ExecutablePath | ConvertTo-Json -Compress",
-  ]);
+  // CommandLine is visible without elevation for same-user processes —
+  // which CC is. Generous timeout: PowerShell cold start (plus AV
+  // scanning) can take several seconds.
+  const json = runCmd(
+    "powershell.exe",
+    [
+      "-NoProfile",
+      "-Command",
+      "Get-CimInstance Win32_Process | Select-Object ProcessId,CommandLine,ExecutablePath | ConvertTo-Json -Compress",
+    ],
+    15_000,
+  );
   if (!json) return [];
   let procs;
   try {
