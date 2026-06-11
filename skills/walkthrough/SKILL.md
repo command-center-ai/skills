@@ -44,6 +44,7 @@ Both arguments are optional. By default the walkthrough covers **the whole diff*
 - `--working-tree` → diff merge-base-against-base to your current working tree (includes uncommitted edits).
 - `--staged` → `HEAD..STAGED` (just what's `git add`-ed).
 - `--port=<port>` → talk to a specific Command Center backend port. Useful when multiple CC instances run (developer environments) or when the runner can't auto-discover the right one.
+- `--discover` → just resolve and report which backend would be used (no other action). Useful for debugging multi-instance setups before committing to a run.
 
 **File filter** — `--files=PATTERN[,PATTERN...]`:
 - Comma-separated repo-relative globs. `*` matches non-slash chars; `**` matches across directories.

@@ -56,6 +56,7 @@ All arguments are optional. By default the runner refactors **every changed file
 - `--files=PATTERN[,PATTERN...]` → narrow to a subset of the changed files. Comma-separated repo-relative globs; `*` matches non-slash chars, `**` crosses directories, a `!` prefix excludes. If you pass only exclusions, the implicit include is `**`.
 - `--timeout-mins=<n>` → how long to wait for the refactoring to finish (default 60). On timeout the refactoring keeps running in Command Center.
 - `--port=<port>` → talk to a specific Command Center backend port. Useful when multiple CC instances run (developer environments) or when the runner can't auto-discover the right one.
+- `--discover` → just resolve and report which backend would be used (no other action). Useful for debugging multi-instance setups before committing to a run.
 
 Note: Command Center additionally screens the file list down to reasonably-sized code files — lockfiles, generated files, and very large files are skipped automatically.
 
