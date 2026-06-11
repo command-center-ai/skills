@@ -57,6 +57,14 @@ const DEFAULT_TASK_TIMEOUT_MS = 60 * 60 * 1_000;
 // reconnection is lossless.
 const SSE_RECONNECT_DELAY_MS = 1_000;
 
+// The backend only reports progress between workflow steps, and a single
+// step (a coding agent reworking many files) can run 15+ minutes — dead
+// silence that calling agents misread as a hang. The backend's 30s SSE
+// pings prove the task is alive, so piggyback a heartbeat status on them
+// whenever we've been quiet this long. Env override is for tests.
+const HEARTBEAT_INTERVAL_MS =
+  Number(process.env.CC_SKILL_HEARTBEAT_MS) || 60_000;
+
 // Workflow keys the backend accepts (shared/src/refactorings/workflow-types.ts).
 const WORKFLOWS = {
   "do-it-all": "refactoring-do-it-all",
@@ -284,8 +292,25 @@ function installSignalHandlers() {
 // completed tasks around in memory, so reconnection is lossless short of
 // a backend restart (which kills the refactoring anyway).
 async function waitForCompletion({ sessionToken, workspaceId, taskId, timeoutMs }) {
-  const deadline = Date.now() + timeoutMs;
+  const startedAt = Date.now();
+  const deadline = startedAt + timeoutMs;
   let lastPct = -1;
+  let lastEmitAt = Date.now();
+
+  const heartbeat = () => {
+    if (Date.now() - lastEmitAt < HEARTBEAT_INTERVAL_MS) return;
+    const mins = Math.round((Date.now() - startedAt) / 60_000);
+    status(
+      `Refactoring still running — ${mins} min elapsed, last reported progress ${Math.max(lastPct, 0)}%. Long quiet stretches are normal: progress only updates between workflow steps, and a single step can take many minutes.`,
+      {
+        percentageDone: Math.max(lastPct, 0),
+        elapsedMinutes: mins,
+        heartbeat: true,
+      },
+    );
+    lastEmitAt = Date.now();
+  };
+
   // Connections that yield no task state at all mean the backend doesn't
   // know the task. One empty connection could race the task registering
   // into completedTasks; two in a row means it's gone.
@@ -299,7 +324,13 @@ async function waitForCompletion({ sessionToken, workspaceId, taskId, timeoutMs 
         input: { workspaceId, taskId },
         sessionToken,
       })) {
-        if (evt.event === "connected" || evt.event === "ping") continue;
+        if (evt.event === "ping") {
+          // Pings arrive every ~30s; they prove the task is alive even
+          // when progress hasn't moved.
+          heartbeat();
+          continue;
+        }
+        if (evt.event === "connected") continue;
         if (evt.event === "return") break;
         if (evt.event === "serialized-error") {
           let parsed = null;
@@ -329,6 +360,7 @@ async function waitForCompletion({ sessionToken, workspaceId, taskId, timeoutMs 
           if (pct !== lastPct) {
             status(`Refactoring… ${pct}%`, { percentageDone: pct });
             lastPct = pct;
+            lastEmitAt = Date.now();
           }
         } else {
           return state; // completed | failed | cancelled
