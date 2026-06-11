@@ -488,7 +488,7 @@ async function main() {
     filesSubmitted: changedFiles,
     dirtyFiles,
     message:
-      "Refactoring complete. The changes are uncommitted edits in the working tree — review them with `git diff`, and re-read any of these files you had cached before editing further. The refactoring session (with explanations of each change) is in the Command Center app's Agents panel.",
+      "Refactoring complete. The changes are uncommitted edits in the working tree. The user should review them in Command Center: the refactoring session in the app's Agents panel explains each change alongside its diff. (You, the calling agent, should re-read any of these files you had cached before editing further.)",
   });
 }
 

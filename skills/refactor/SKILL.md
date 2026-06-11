@@ -81,7 +81,7 @@ The runner prints one JSON object per line on stdout. Each line has a `kind` fie
 
 Always surface the runner's `message` verbatim — do not rephrase. The runner produces user-facing strings in English; backend-originated strings are already localized.
 
-After a successful run, review the diff before relying on it: the refactoring is AI-generated. If the user dislikes the result, `git checkout -- <files>` (or `git stash`) reverts it, since nothing was committed.
+The refactoring is AI-generated, so it should be reviewed before being relied on — in Command Center, where each change comes with its explanation. If the user dislikes the result, `git checkout -- <files>` (or `git stash`) reverts it, since nothing was committed.
 
 ## Cancellation
 
