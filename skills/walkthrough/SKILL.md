@@ -15,6 +15,8 @@ The user asks for a walkthrough of the current branch, a pull request, a commit 
 - "Walk me through the changes since main."
 - "Generate a walkthrough for HEAD~5..HEAD."
 
+If this agent is running from inside of Command Center, then there is a separate walkthrough tool or skill available. Do not confuse this skill with that one. This skill is for generating a walkthrough of an entire diff. The other one is for generating a target walkthrough any an arbitrary piece of code, be it a diff, the dataflow of a bug, a sign in flow, all uses of a certain method in the codebase, etc.
+
 ## How to invoke
 
 Run `run.mjs` — it sits in the same directory as this `SKILL.md`. The runner does all the work: installation detection, backend startup, auth/model/workspace checks, walkthrough generation, and browser open.
